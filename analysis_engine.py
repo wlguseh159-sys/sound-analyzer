@@ -246,3 +246,165 @@ def synthetic_demo(mode: str = 'band') -> tuple[bytes,bytes]:
         sf.write(buffer,x,rate,format='WAV',subtype='PCM_16')
         return buffer.getvalue()
     return wav(drum if mode=='drum' else good),wav(bad)
+
+# === Version 4: drum-anchored relative balance analysis ===
+
+def rms_db(signal_array):
+    a=np.asarray(signal_array,dtype=np.float64)
+    return float(20*np.log10(np.sqrt(np.mean(a*a))+1e-10)) if a.size else -200.
+
+
+def estimate_parts(mix,sr=SR,drum_stem=None):
+    """Return (drum, remaining, method).
+
+    When `drum_stem` is supplied, treat it as a time-aligned, properly-scaled
+    source separation. Otherwise HPSS percussive component is only a PROXY:
+    transients from guitar/vocals/cymbals may be included and drums may leak.
+    """
+    mix=mono(mix)
+    if drum_stem is None:
+        drum=percussive_estimate(mix,sr)
+        method='HPSS 타격성 추정 (드럼 분리 아님)'
+    else:
+        drum=mono(drum_stem)
+        if len(drum)<len(mix): drum=np.pad(drum,(0,len(mix)-len(drum)))
+        drum=drum[:len(mix)]
+        method='제공된 드럼 분리 트랙'
+    return drum.astype(np.float32),(mix-drum).astype(np.float32),method
+
+
+def balance_windows(drums,remaining,mix,win_sec=1.,sr=SR,silence_limit=-46.):
+    """Compute L_other-L_drum, dB per non-overlapping window."""
+    drum=mono(drums); rest=mono(remaining); y=mono(mix)
+    n=min(len(drum),len(rest),len(y)); size=max(1,int(round(win_sec*sr)))
+    records=[]
+    for ix in range((n+size-1)//size):
+        a=ix*size;b=min(n,a+size)
+        if b-a<int(sr*.25):continue
+        ld=rms_db(drum[a:b]); lo=rms_db(rest[a:b]); lm=rms_db(y[a:b])
+        # Skip when drum baseline is near silence; ratio becomes meaningless.
+        valid=bool(ld>silence_limit and lm>silence_limit)
+        records.append({'start':a/sr,'end':b/sr,'drum_db':ld,'rest_db':lo,'mix_db':lm,
+                        'balance_db':lo-ld if valid else np.nan,'valid':valid})
+    return records
+
+
+def good_baseline(good,good_drum=None,win_sec=1.,sr=SR):
+    gd,go,gm=estimate_parts(good,sr,good_drum)
+    windows=balance_windows(gd,go,good,win_sec,sr)
+    values=np.array([w['balance_db'] for w in windows if w['valid']],dtype=float)
+    if values.size<2:raise ValueError('정상 음원에서 유효한 드럼 기준 구간이 부족합니다. 드럼이 들리는 구간을 선택해 주세요.')
+    return {'baseline':float(np.median(values)),
+            'baseline_spread':float(np.quantile(values,.75)-np.quantile(values,.25)),
+            'reference_windows':windows, 'n_reference':int(len(values)),
+            'good_drum':gd,'good_rest':go,'method':gm}
+
+
+def analyze_balance_chunk(bad,bad_start,baseline,threshold_db=3.,bad_drum=None,
+                          win_sec=1.,sr=SR):
+    bd,bo,method=estimate_parts(bad,sr,bad_drum)
+    rec=balance_windows(bd,bo,bad,win_sec,sr)
+    for w in rec:
+        w['start']+=bad_start;w['end']+=bad_start
+        w['delta_db']=float(w['balance_db']-baseline) if w['valid'] else np.nan
+        w['suspect']=bool(w['valid'] and abs(w['delta_db'])>=threshold_db)
+        w['direction']='다른 악기 상대적으로 큼' if w['suspect'] and w['delta_db']>0 else ('다른 악기 상대적으로 작음' if w['suspect'] else '검토 기준 이내')
+    return rec,bd,bo,method
+
+
+def consolidate_balance_windows(records,step=1.,max_gap=0.05):
+    """Join consecutive suspect windows without crossing valid quiet gaps."""
+    found=[]
+    for w in records:
+        if not w['suspect']:continue
+        if found and w['start']-found[-1]['end']<=max_gap and np.sign(w['delta_db'])==found[-1]['sign']:
+            found[-1]['end']=w['end']
+            found[-1]['peak_delta_db']=w['delta_db'] if abs(w['delta_db'])>abs(found[-1]['peak_delta_db']) else found[-1]['peak_delta_db']
+            found[-1]['deltas'].append(w['delta_db'])
+        else:
+            found.append({'start':w['start'],'end':w['end'],'peak_delta_db':w['delta_db'],
+                          'deltas':[w['delta_db']],'sign':np.sign(w['delta_db'])})
+    for w in found:
+        w['avg_delta_db']=float(np.median(w.pop('deltas')))
+        w['start']=round(float(w['start']),2);w['end']=round(float(w['end']),2)
+        w['peak_delta_db']=round(float(w['peak_delta_db']),2)
+        w['avg_delta_db']=round(float(w['avg_delta_db']),2)
+        w['direction']='드럼 대비 다른 악기 큼' if w.pop('sign')>0 else '드럼 대비 다른 악기 작음'
+    return found
+
+
+def scan_bad_audio(raw,start,duration,baseline,threshold_db=3.,bad_drum_raw=None,
+                   chunk_sec=10.,win_sec=1.,sr=SR):
+    """Scan a long uploaded mix with bounded memory by reading audio in chunks.
+
+    For uploaded drum stems we read matching offsets. No AI model is downloaded.
+    """
+    records=[]
+    end=start+duration
+    current=start
+    while current<end-1e-5:
+        d=min(chunk_sec,end-current)
+        x=read_segment(raw,current,d,sr)
+        stem=read_segment(bad_drum_raw,current,d,sr) if bad_drum_raw is not None else None
+        r,_,_,_=analyze_balance_chunk(x,current,baseline,threshold_db,stem,win_sec,sr)
+        records.extend(r)
+        current+=d
+    return records
+
+
+def band_normalized_summary(good,bad,sr=SR):
+    """Band-wise good/bad STFT summaries with per-frame distributions.
+    Differences are descriptive, not proof that an instrument is distorted.
+    """
+    rows,a,b=summarize_bands(good,bad,sr)
+    return rows,a,b
+
+
+def synthetic_balance_demo(duration=12.,sr=SR):
+    """Two paired, artificial sources with known +6 dB OTHER increase at 4-6s.
+    Returns good mix, bad mix, good drums, bad drums, and truth interval.
+    """
+    rng=np.random.default_rng(87)
+    n=int(duration*sr);time=np.arange(n)/sr
+    drum=np.zeros(n,dtype=np.float32)
+    for hit in np.arange(.25,duration-.05,.5):
+        pos=int(hit*sr);m=min(n-pos,int(sr*.15));t=np.arange(m)/sr
+        drum[pos:pos+m]+=(.22*np.exp(-36*t)*np.sin(2*np.pi*83*t)+.065*np.exp(-70*t)*rng.standard_normal(m)).astype(np.float32)
+    other=(.03*np.sin(2*np.pi*330*time)+.03*np.sin(2*np.pi*440*time)+.015*np.sin(2*np.pi*660*time)).astype(np.float32)
+    good=drum+other
+    bad_other=other.copy();where=(time>=4.)&(time<6.);bad_other[where]*=2.
+    bad=drum+bad_other
+    return good.astype(np.float32),bad.astype(np.float32),drum,drum, (4.,6.)
+
+# High-resolution FINAL frequency display runs at 44.1 kHz so that the
+# source document's 10-20 kHz ultra-high band can actually be measured.
+DETAIL_SR=44100
+DETAIL_BANDS=[
+    ('20–120 Hz',20,120,'킥/베이스 중첩'),
+    ('120–400 Hz',120,400,'스네어/베이스/기타 중첩'),
+    ('400–2k Hz',400,2000,'기타/보컬/스네어 중첩'),
+    ('2–6k Hz',2000,6000,'스네어 어택/기타/보컬 중첩'),
+    ('6–10k Hz',6000,10000,'심벌/자음/잡음 중첩'),
+    ('10–20k Hz',10000,20000,'심벌 초고역/잡음 중첩'),
+]
+
+
+def fullband_summary(good,bad,sr=DETAIL_SR):
+    """Same absolute-frequency STFT bands for each recording at 44.1 kHz.
+
+    Must supply signals sampled at sr, not upsampled lossy 22.05k versions.
+    """
+    output=[];dist_good={};dist_bad={}
+    for src,dest in [(good,dist_good),(bad,dist_bad)]:
+        f,t,z=stft(src,sr=sr,nfft=2048,hop=512)
+        p=np.abs(z)**2
+        for label,lo,hi,ins in DETAIL_BANDS:
+            which=(f>=lo)&(f<hi)
+            if not np.any(which):raise ValueError(f'{label}를 분석하려면 44.1kHz 이상의 음원이 필요합니다.')
+            dest[label]=10*np.log10(p[which].sum(axis=0)+1e-12)
+    for label,_,_,ins in DETAIL_BANDS:
+        x=float(np.median(dist_good[label]));y=float(np.median(dist_bad[label]))
+        output.append({'주파수 대역':label,'Good 중앙값 (dB)':round(x,2),
+                       'Broken 중앙값 (dB)':round(y,2),
+                       '차이 (dB)':round(y-x,2),'중첩 가능 소리':ins})
+    return output,dist_good,dist_bad
