@@ -1,162 +1,298 @@
-"""Sound Analyzer: upload/record -> review candidates -> optional real AI stems -> frequency map.
+"""Sound Analyzer v3: normal-reference comparison, suspicious-window STFT, violin plots.
 
-Launch: py -m streamlit run app.py
+Created for an engineering design midterm demo, not a calibrated distortion meter.
 """
 from __future__ import annotations
-
+from io import BytesIO
 import hashlib
-
+from pathlib import Path
 import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
 import streamlit as st
 
-from audio_engine import (BANDS, STEM_NAMES, analyze_mix, band_table, csv_bytes,
-                          inspect_audio, read_segment, wav_bytes, scan_entire_file)
-from stem_separator import is_available, separate
-from visuals import overview_plot, stem_heatmap, export_report
+from analysis_engine import (
+    SR,BANDS,info,read_segment,stft,mono,detect_drum_reference,
+    detect_good_bad,summarize_bands,synthetic_demo,
+)
 
-st.set_page_config(page_title="Sound Analyzer | 공학설계", page_icon="🎛️", layout="wide")
-st.title("🎛️ Sound Analyzer")
-st.caption("공학설계 · 녹음/업로드 → 전체 STFT → 검토 구간 → AI 악기 분리 → 악기별 주파수 비교")
-st.warning("정확도 안내: '특성 변화'는 손상 확정이 아닙니다. 악기 분리에도 누출·인공 잡음이 생길 수 있습니다. 실제 클리핑 판정과 청취 검증을 함께 진행하세요.")
+HERE=Path(__file__).resolve().parent
+st.set_page_config(page_title='Sound Analyzer v3 · 공학설계',page_icon='🥁',layout='wide')
+st.markdown('''<style>
+.block-container{padding-top:2rem;max-width:1200px}
+h1{letter-spacing:-.03em}
+[data-testid="stMetric"]{background:rgba(128,128,128,.07);padding:1rem;border-radius:.7rem}
+</style>''', unsafe_allow_html=True)
 
-st.subheader("① 음원 입력")
-mode = st.radio("입력 방식", ["음원 파일 업로드", "브라우저 마이크 녹음"], horizontal=True)
-if mode == "음원 파일 업로드":
-    uploaded = st.file_uploader("MP3 / WAV / FLAC 파일 선택", type=["mp3", "wav", "flac"])
+
+def as_wav(x,sr=SR):
+    import soundfile as sf
+    buf=BytesIO()
+    sf.write(buf,np.asarray(x,dtype=np.float32),sr,format='WAV',subtype='PCM_16')
+    return buf.getvalue()
+
+
+def spectrum_fig(x,origin,sr=SR):
+    f,t,z=stft(x,sr=sr,nfft=2048,hop=256)
+    idx=(f>=20)&(f<=10000)
+    power=20*np.log10(np.abs(z[idx])+1e-7)
+    fig=go.Figure(go.Heatmap(x=t+origin,y=f[idx],z=power,zmin=-95,zmax=-20,
+                              colorscale='Viridis',colorbar=dict(title='dB')))
+    fig.update_layout(height=360,margin=dict(l=4,r=4,t=16,b=12),
+                      xaxis_title='시간 (초)',yaxis_title='주파수 (Hz)')
+    return fig
+
+
+def wave_fig(audio,windows,offset,sr=SR):
+    y=mono(audio)
+    step=max(1,len(y)//4500)
+    t=offset+np.arange(0,len(y),step)/sr
+    fig=go.Figure(go.Scatter(x=t,y=y[::step],mode='lines',name='음원 파형',
+                             line=dict(color='#508bbd',width=1)))
+    for w in windows:
+        fig.add_vrect(x0=offset+w['start'],x1=offset+w['end'],
+                      fillcolor='red',opacity=.17,line_width=0)
+    fig.update_layout(height=245,xaxis_title='원본 음원 시간 (초)',yaxis_title='진폭',
+                      margin=dict(l=5,r=5,t=10,b=10))
+    return fig
+
+
+def score_fig(result,offset):
+    times=result['times'];scores=result['scores'];thr=result['threshold']
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=offset+times,y=scores,name='비교 점수',
+                             mode='lines+markers',marker=dict(size=5)))
+    fig.add_hline(y=thr,line_dash='dash',line_color='#d97757',annotation_text='검토 기준선')
+    fig.update_layout(height=230,margin=dict(l=5,r=10,t=10,b=10),
+                      xaxis_title='분석 음원 시간 (초)',yaxis_title='차이 점수 (상대값)')
+    return fig
+
+
+def violin_fig(reference,candidate):
+    rows=[]
+    for label in reference:
+        for title,vals in [('정상 기준',reference[label]),('이상 의심',candidate[label])]:
+            values=np.asarray(vals,dtype=float)
+            # enough data for distribution without sending thousands of data points to browser
+            idx=np.linspace(0,len(values)-1,min(len(values),130)).astype(int)
+            rows.extend([{'주파수 대역':label,'STFT 대역 에너지 (dB)':float(v),'구분':title} for v in values[idx]])
+    df=pd.DataFrame(rows)
+    fig=px.violin(df,x='주파수 대역',y='STFT 대역 에너지 (dB)',color='구분',
+                  box=True,points=False,violinmode='group',
+                  color_discrete_map={'정상 기준':'#3C85B5','이상 의심':'#E07861'})
+    fig.update_layout(height=420,margin=dict(l=10,r=5,t=25,b=10),legend_title_text='')
+    return fig
+
+
+def png_report(audio,offset,w,good,reference_name,refdb,baddb):
+    # All labels in PNG are in English to avoid unsupported Korean fonts on Linux.
+    f,t,z=stft(audio,nfft=2048,hop=256)
+    keep=(f>=20)&(f<=10000)
+    fig,axes=plt.subplots(3,1,figsize=(11,11),layout='constrained',
+                          gridspec_kw={'height_ratios':[1,2.3,1.7]})
+    y=mono(audio)
+    step=max(1,len(y)//4000)
+    axes[0].plot(offset+np.arange(0,len(y),step)/SR,y[::step],lw=.6)
+    axes[0].axvspan(offset+w['start'],offset+w['end'],alpha=.23,color='orangered')
+    axes[0].set(title='A. Waveform and selected review window',xlabel='Time (s)',ylabel='Amplitude')
+    f2,t2,z2=stft(audio[int(w['start']*SR):int(w['end']*SR)],nfft=2048,hop=256)
+    sel=(f2>=20)&(f2<=10000)
+    power=20*np.log10(abs(z2[sel])+1e-7)
+    heat=axes[1].pcolormesh(t2+offset+w['start'],f2[sel],power,shading='auto',
+                             cmap='viridis',vmin=-95,vmax=-20)
+    fig.colorbar(heat,ax=axes[1],label='Magnitude (dB)')
+    axes[1].set(title='B. STFT of selected window',xlabel='Time (s)',ylabel='Frequency (Hz)')
+    group=[];positions=[];colours=[]
+    for i,(name,_,_,_) in enumerate(BANDS):
+        group.extend([refdb[name],baddb[name]])
+        positions.extend([3*i+1,3*i+2])
+        colours+=['#4E86AA','#D8795B']
+    violin=axes[2].violinplot(group,positions=positions,showmedians=True,showextrema=False)
+    for obj,c in zip(violin['bodies'],colours):obj.set_facecolor(c);obj.set_alpha(.65)
+    axes[2].set_xticks([3*i+1.5 for i in range(len(BANDS))],
+                       ['20-120','120-400','400-2k','2k-6k','6k-10k'])
+    axes[2].set(title=f'C. STFT band-energy distributions: {reference_name} vs candidate',
+                xlabel='Frequency band (Hz)',ylabel='Band energy (relative dB)')
+    axes[2].plot([],[],color='#4E86AA',lw=8,label='Good / baseline')
+    axes[2].plot([],[],color='#D8795B',lw=8,label='Candidate')
+    axes[2].legend(fontsize=8,loc='lower right')
+    fig.suptitle('Sound Analyzer v3 | Suspected segment is NOT verified clipping',weight='bold')
+    output=BytesIO();fig.savefig(output,format='png',dpi=155,bbox_inches='tight')
+    plt.close(fig)
+    return output.getvalue()
+
+
+st.title('🥁 Sound Analyzer v3')
+st.caption('공학설계 중간발표 · 정상 기준 → 의심 구간 탐지 → 해당 구간 STFT → 주파수 대역 바이올린 플롯')
+st.warning('⚠️ 검출된 것은 **기준과 다른 이상 의심 구간**입니다. 주파수 대역만으로 특정 악기 고장이나 실제 음질 왜곡을 확정할 수 없습니다.')
+
+with st.sidebar:
+    st.header('분석 설정')
+    mode=st.radio('비교 방식',[
+        '정상 합주 vs 문제 합주 (권장)',
+        '정상 드럼 vs 문제 합주 (실험)',
+    ],help='정상 드럼 단독 vs 전체 합주는 다른 악기 소리 때문에 오탐할 수 있습니다.')
+    sensitivity=st.slider('이상 탐지 민감도',.6,2.0,1.0,step=.1,
+                           help='높이면 더 많은 후보를 표시하지만 오탐도 늘 수 있습니다.')
+    st.divider()
+    st.markdown('**실험 설계 팁**')
+    st.caption('good/bad는 같은 곡의 같은 구간, 유사한 볼륨·마이크 위치여야 합니다. 드럼 기준 비교는 드럼 단독 트랙을 쓰는 것이 좋습니다.')
+
+st.subheader('① 정상 기준 및 문제 음원 입력')
+use_demo=st.checkbox('🎧 제공된 합성 good/bad 테스트 음원으로 시연하기',value=False,
+                     help='실제 합주 음원과 구분되는 교육용 합성 파일입니다.')
+left,right=st.columns(2)
+if use_demo:
+    drum_demo=mode.startswith('정상 드럼')
+    good_bytes,bad_bytes=synthetic_demo('drum' if drum_demo else 'band')
+    left.success('정상 기준: 합성 드럼' if drum_demo else '정상 기준: 합성 good 합주')
+    right.success('문제 음원: 합성 bad 합주')
 else:
-    uploaded = st.audio_input("녹음 버튼을 눌러 10초 연주한 뒤 정지하세요", sample_rate=44100)
+    with left:
+        st.markdown('**정상 기준 (good)**')
+        st.caption('정상 합주 또는 기준 드럼 녹음')
+        good_upload=st.file_uploader('Good 음원',type=['wav','mp3','flac'],key='good')
+        good_bytes=good_upload.getvalue() if good_upload is not None else None
+    with right:
+        st.markdown('**문제 음원 (bad)**')
+        st.caption('실제 합주 녹음')
+        choice=st.radio('문제 음원 입력 방식',['파일 업로드','브라우저 녹음'],horizontal=True)
+        if choice=='파일 업로드':
+            bad_upload=st.file_uploader('Bad 음원',type=['wav','mp3','flac'],key='bad')
+        else:
+            bad_upload=st.audio_input('Bad 합주 녹음',sample_rate=44100)
+        bad_bytes=bad_upload.getvalue() if bad_upload is not None else None
 
-if uploaded is None:
-    st.info("음원을 먼저 올리거나 마이크로 녹음하세요. 처음에는 10초 음원을 추천합니다.")
+if not (good_bytes and bad_bytes):
+    st.info('정상 기준 파일과 문제 음원을 각각 올리거나, 위의 **합성 테스트 음원으로 시연하기**를 체크한 후 분석을 시작하세요.')
     st.stop()
 
-raw = uploaded.getvalue()
-digest = hashlib.sha256(raw).hexdigest()
-format_name = (getattr(uploaded, "name", "") or "").lower()
-st.audio(raw, format="audio/mp3" if format_name.endswith(".mp3") else "audio/flac" if format_name.endswith(".flac") else "audio/wav")
 try:
-    info = inspect_audio(raw)
-except Exception as exc:
-    st.error(f"음원 파일을 열 수 없습니다: {exc}. MP3에서 오류가 난다면 WAV로 변환해서 다시 시도하세요.")
-    st.stop()
+    good_meta=info(good_bytes);bad_meta=info(bad_bytes)
+except ValueError as exc:
+    st.error(str(exc));st.stop()
 
-m1, m2, m3 = st.columns(3)
-m1.metric("전체 길이", f"{info['duration']:.1f}초")
-m2.metric("샘플링", f"{info['sample_rate']:,} Hz")
-m3.metric("채널", str(info["channels"]))
-max_start = max(0.0, info["duration"] - .5)
-start_input_key = f"start_{digest[:16]}"
-if start_input_key not in st.session_state:
-    st.session_state[start_input_key] = 0.0
-if info["duration"] > 10.5:
-    with st.expander("🔎 전체 음원에서 의심 후보 먼저 찾아보기 (긴 파일용)", expanded=False):
-        st.caption("전체 파일을 10초 블록으로 훑고 상대적으로 급격한 음향 변화가 있는 후보를 찾습니다. 확정적인 왜곡 탐지가 아닙니다.")
-        if st.button("전체 파일 빠른 탐색 (최대 10분)"):
-            try:
-                with st.spinner("전체 파일을 순차 분석 중..."):
-                    st.session_state["fullscan"] = {"digest": digest, "rows": scan_entire_file(raw)}
-            except Exception as exc:
-                st.error(f"전체 파일 탐색 실패: {exc}")
-        scan_state = st.session_state.get("fullscan")
-        if scan_state and scan_state["digest"] == digest and scan_state["rows"]:
-            idx = st.selectbox("자동 탐색된 후보", range(len(scan_state["rows"])),
-                               format_func=lambda i: f"{scan_state['rows'][i]['start']:.1f}~{scan_state['rows'][i]['end']:.1f}초 · {scan_state['rows'][i]['category']}")
-            if st.button("이 후보 주변 10초 구간으로 이동"):
-                focus = scan_state["rows"][idx]["start"]
-                st.session_state[start_input_key] = float(min(max_start, max(0.0, focus - 3.0)))
-                st.rerun()
-start = st.number_input("분석 시작 시점 (초)", min_value=0.0, max_value=float(max_start),
-                        key=start_input_key, step=0.5)
-segment_seconds = min(10.0, info["duration"] - float(start))
-st.caption(f"현재 선택: {start:.1f}~{start+segment_seconds:.1f}초 (최대 10초)")
-key = (digest, float(start), round(segment_seconds, 2))
+with st.expander('업로드한 음원 확인',expanded=False):
+    c1,c2=st.columns(2)
+    with c1:
+        st.write(f'Good · {good_meta["duration"]:.1f}초 · {good_meta["sr"]} Hz')
+        good_format='audio/wav' if use_demo else ({'wav':'audio/wav','mp3':'audio/mpeg','flac':'audio/flac'}).get(good_upload.name.rsplit('.',1)[-1].lower(),'audio/wav')
+        st.audio(good_bytes,format=good_format)
+    with c2:
+        st.write(f'Bad · {bad_meta["duration"]:.1f}초 · {bad_meta["sr"]} Hz')
+        bad_format='audio/wav' if use_demo or choice=='브라우저 녹음' else ({'wav':'audio/wav','mp3':'audio/mpeg','flac':'audio/flac'}).get(bad_upload.name.rsplit('.',1)[-1].lower(),'audio/wav')
+        st.audio(bad_bytes,format=bad_format)
 
-st.subheader("② 전체 음원에서 검토 구간 찾기")
-if st.button("🔍 STFT 및 이상 의심 구간 분석", type="primary", use_container_width=True):
+col1,col2,col3=st.columns(3)
+max_bad=max(0.,bad_meta['duration']-.6)
+max_good=max(0.,good_meta['duration']-.6)
+with col1:
+    start_bad=st.number_input('Bad 음원 분석 시작 (초)',min_value=0.,max_value=float(max_bad),value=0.,step=.5)
+with col2:
+    start_good=st.number_input('Good 음원 시작 (초)',min_value=0.,max_value=float(max_good),value=0.,step=.5)
+with col3:
+    max_sec=max(.4,min(20.,bad_meta['duration']-start_bad,good_meta['duration']-start_good))
+    length=st.number_input('분석 길이 (초)',min_value=.4,max_value=float(max_sec),value=float(min(10.,max_sec)),step=.5)
+
+# Changing audio, mode, or the selection must invalidate the previous chart.
+config_key=(hashlib.sha256(good_bytes).hexdigest(),hashlib.sha256(bad_bytes).hexdigest(),
+            mode,round(start_bad,3),round(start_good,3),round(length,3),round(sensitivity,2))
+if st.session_state.get('v3_config_key')!=config_key:
+    st.session_state.pop('result_v3',None)
+    st.session_state['v3_config_key']=config_key
+
+if mode.startswith('정상 드럼'):
+    st.info('드럼 기준 실험: **Good 드럼 타격 형태**를 기준으로 Bad 합주의 타격성 소리를 비교합니다. 기타·보컬 등의 영향이 포함될 수 있습니다.')
+else:
+    st.info('정상 합주 비교: Good/Bad가 **같은 연주 위치·박자·악기 구성**일 때 비교가 가장 유효합니다. 시작 시간을 맞추세요.')
+
+if st.button('🔎 정상 기준과 비교해 의심 구간 찾기',type='primary',use_container_width=True):
     try:
-        with st.spinner("10초 구간을 분석 중입니다..."):
-            audio, sr = read_segment(raw, float(start), segment_seconds)
-            result = analyze_mix(audio, sr, offset=float(start))
-            st.session_state["current"] = {"key": key, "result": result, "audio": audio, "sr": sr}
-            st.session_state.pop("stems", None)
+        with st.spinner('음원을 읽고 주파수 특징을 비교하는 중...'):
+            good=read_segment(good_bytes,start_good,length)
+            bad=read_segment(bad_bytes,start_bad,length)
+            if mode.startswith('정상 드럼'):
+                detection=detect_drum_reference(good,bad,sensitivity=sensitivity,good_is_drum=True)
+            else:
+                detection=detect_good_bad(good,bad,sensitivity=sensitivity)
+            st.session_state['result_v3']={
+                'good':good,'bad':bad,'det':detection,'start_bad':start_bad,
+                'start_good':start_good,'drum_mode':mode.startswith('정상 드럼'),
+                'reference_name':'normal drums' if mode.startswith('정상 드럼') else 'aligned good band',
+            }
     except Exception as exc:
-        st.error(f"음원 분석 실패: {exc}")
+        st.error(f'분석 실패: {exc}')
+        st.stop()
 
-state = st.session_state.get("current")
-if not state or state["key"] != key:
-    st.caption("위 분석 버튼을 누르면 다음 단계가 열립니다.")
+if 'result_v3' not in st.session_state:
     st.stop()
 
-result = state["result"]
-if result["clip_count"]:
-    st.error(f"높은 진폭에서 파형 평탄화가 의심되는 샘플 {result['clip_count']}개가 관찰됐습니다. 청취 및 원본 확인이 필요합니다.")
-else:
-    st.info("강한 평탄화(클리핑) 징후는 탐지되지 않았습니다. 아래 후보들은 급격한 음향 변화가 나타난 구간입니다.")
+r=st.session_state['result_v3']
+det=r['det'];windows=det['windows'];good=r['good'];bad=r['bad'];offset=r['start_bad']
+st.subheader('② 기준과 다른 구간 자동 탐지')
+x,y,z=st.columns(3)
+x.metric('의심 구간 수',len(windows))
+y.metric('검토 기준 점수',f'{det["threshold"]:.2f}')
+z.metric('검출 방법','드럼 타격 비교' if r['drum_mode'] else 'good/bad STFT 비교')
+st.plotly_chart(wave_fig(bad,windows,offset),use_container_width=True)
+st.plotly_chart(score_fig(det,offset),use_container_width=True)
 
-candidates = result["candidates"]
-if not candidates:
-    st.error("검토 구간을 찾지 못했습니다.")
+if not windows:
+    st.success('선택한 조건에서 기준을 초과한 의심 구간을 발견하지 못했습니다. **정상이라는 확정 판정은 아닙니다.** 민감도를 조정하거나 다른 구간을 검사할 수 있습니다.')
     st.stop()
-options = list(range(len(candidates)))
-selected_id = st.selectbox("자세히 볼 구간을 선택하세요", options,
-                           format_func=lambda i: f"{candidates[i]['start']:.2f}~{candidates[i]['end']:.2f}초 · {candidates[i]['category']} (상대점수 {candidates[i]['review_score']:.2f})")
-selected = candidates[selected_id]
-st.plotly_chart(overview_plot(result, selected), use_container_width=True)
-st.caption("분홍 음영 = 현재 선택된 구간. 일반적인 드럼 타격, 보컬 진입, 후렴 시작도 특성 변화로 검출될 수 있습니다.")
-with st.expander("구간별 검사 수치 보기"):
-    st.dataframe(result["rows"], use_container_width=True, hide_index=True)
 
-start_idx = max(0, int(round((selected["start"] - start) * state["sr"])))
-end_idx = min(len(state["audio"]), int(round((selected["end"] - start) * state["sr"])))
-if end_idx > start_idx:
-    st.write("**선택 구간만 다시 듣기**")
-    st.audio(wav_bytes(state["audio"][start_idx:end_idx], state["sr"]), format="audio/wav")
-
-st.subheader("③ 악기별 분리 및 주파수 대역 비교")
-st.markdown("**기본값은 보컬·드럼·베이스·기타 악기(통합) 4개 그룹**으로 분리합니다. 기타와 피아노를 별도로 나누는 6분리 모델은 실험적이며 정확도가 낮을 수 있습니다.")
-model_label = st.radio("분리 그룹", ["4개 그룹 (권장)", "6개 그룹 (실험적)"], horizontal=True)
-model = "htdemucs" if model_label.startswith("4") else "htdemucs_6s"
-if not is_available():
-    st.error("이 컴퓨터에는 AI 악기 분리 패키지 Demucs가 설치되지 않았습니다. 아래 명령어 설치 후 앱을 새로고침하세요.")
-    st.code("py -m pip install demucs", language="powershell")
-    st.caption("설치 전에도 위 STFT 분석은 가능합니다. 설치 후에는 모델 가중치가 처음 실행할 때 다운로드될 수 있습니다.")
+wdf=pd.DataFrame([{'번호':i+1,'시작 (초)':round(offset+w['start'],2),
+                  '끝 (초)':round(offset+w['end'],2),'차이 점수':w['score'],
+                  '이유':w['method']} for i,w in enumerate(windows)])
+st.dataframe(wdf,use_container_width=True,hide_index=True)
+st.download_button('의심 구간 CSV 저장',data=wdf.to_csv(index=False).encode('utf-8-sig'),
+                   file_name='suspected_windows.csv',mime='text/csv')
+choice=st.selectbox('자세히 분석할 구간 선택',options=list(range(len(windows))),
+                     format_func=lambda i:f'{i+1}번 · {offset+windows[i]["start"]:.2f} ~ {offset+windows[i]["end"]:.2f}초')
+w=windows[choice]
+start_idx=int(w['start']*SR);end_idx=int(w['end']*SR)
+# Add 0.05 second edges for spectrogram while preserving selected region.
+start_idx=max(0,start_idx);end_idx=min(len(bad),max(end_idx,start_idx+int(.15*SR)))
+bad_piece=bad[start_idx:end_idx]
+if r['drum_mode']:
+    good_piece=good  # full clean reference used for violin distribution
+    comparison_title='정상 드럼 전체 기준 / Bad 선택 구간 (녹음 구성 다름)'
 else:
-    st.caption("첫 실행에서는 AI 모델 가중치를 다운로드할 수 있습니다. CPU 환경에서는 계산 부담이 큽니다. 모델은 10초 선택 구간만 처리합니다.")
-    if st.button("🎚️ 실제 AI 악기 분리 실행", use_container_width=True):
-        try:
-            with st.spinner("Demucs가 분리 중입니다. 첫 실행 시 모델 파일 다운로드가 필요할 수 있습니다..."):
-                stems, sep_sr = separate(state["audio"], state["sr"], model)
-                st.session_state["stems"] = {"key": key, "model": model, "stems": stems, "sr": sep_sr}
-        except Exception as exc:
-            st.error(f"악기 분리에 실패했습니다: {exc}")
-            st.caption("ffmpeg 설치, Demucs/torch 의존성, 인터넷 연결(첫 모델 다운로드)을 확인하세요.")
+    good_piece=good[min(start_idx,len(good)-1):min(end_idx,len(good))]
+    comparison_title='같은 시간 good 합주 / bad 합주'
 
-stem_state = st.session_state.get("stems")
-records = None
-if stem_state and stem_state["key"] == key and stem_state["model"] == model:
-    st.success("실제 AI 악기 분리 완료. 선택 구간에서 각 악기의 주파수 변화를 비교합니다.")
-    records = band_table(stem_state["stems"], stem_state["sr"], selected["start"], selected["end"], float(start))
-    st.plotly_chart(stem_heatmap(records), use_container_width=True)
-    st.caption("붉은색(+dB)은 다른 구간에 비해 해당 대역 에너지가 큰 상태입니다. '깨진 악기'를 확정한다는 뜻이 아닙니다.")
-    best = sorted(((row["stem"], band, value) for row in records for band, value in row.items() if band in BANDS),
-                  key=lambda item: item[2], reverse=True)
-    if best:
-        name, band, val = best[0]
-        st.write(f"**상대적으로 변화가 큰 조합:** {name} / {band} Hz 대역 ({val:+.1f} dB, 다른 구간 대비)")
-    st.markdown("**악기별 소리 듣기 및 저장**")
-    for name, stem in stem_state["stems"].items():
-        with st.expander(f"🎧 {STEM_NAMES.get(name, name)}", expanded=False):
-            st.audio(wav_bytes(stem, stem_state["sr"]), format="audio/wav")
-            st.download_button(f"{STEM_NAMES.get(name, name)} WAV 내려받기",
-                               data=wav_bytes(stem, stem_state["sr"]), file_name=f"{name}.wav",
-                               mime="audio/wav", key=f"download_stem_{name}")
-else:
-    st.info("AI 분리를 실행하면 이 위치에 **악기 × 주파수 대역** 열지도가 나타납니다. 분리하지 않은 음원을 악기별로 분리한 것처럼 표시하지 않습니다.")
+st.subheader('③ 선택한 구간 STFT')
+st.caption(f'Bad 원본 기준: {offset+w["start"]:.2f} ~ {offset+w["end"]:.2f}초 · 이 구간만 상세 STFT 표시')
+st.plotly_chart(spectrum_fig(bad_piece,offset+w['start']),use_container_width=True)
+st.audio(as_wav(bad_piece),format='audio/wav')
 
-st.subheader("④ 결과 다운로드")
-png = export_report(result, selected, records)
-st.download_button("🖼️ 결과 그래프 PNG 다운로드", data=png, file_name="sound_analysis_report.png", mime="image/png")
-st.download_button("📋 구간별 분석 CSV 다운로드", data=csv_bytes(result["rows"]), file_name="review_candidates.csv", mime="text/csv")
-if records:
-    st.download_button("📊 악기별 대역 CSV 다운로드", data=csv_bytes(records), file_name="stems_frequency_bands.csv", mime="text/csv")
-st.caption("실험 결과 보고 시 데이터가 정상 연주인지, 실제 왜곡인지 원본/정상 참조 음원과 비교해서 판단해야 합니다.")
+st.subheader('④ STFT 기반 바이올린 플롯 · 주파수 대역 차이')
+st.caption(comparison_title)
+summary,refdist,baddist=summarize_bands(good_piece,bad_piece)
+st.plotly_chart(violin_fig(refdist,baddist),use_container_width=True)
+st.dataframe(pd.DataFrame(summary),use_container_width=True,hide_index=True)
+top=max(summary,key=lambda x:abs(x['차이 (dB)']))
+st.markdown(f'**선택 구간에서 차이가 가장 큰 대역:** {top["주파수 대역"]} (에너지 중앙값 차이 {top["차이 (dB)"]:+.1f} dB)')
+st.caption('이는 STFT 대역별 에너지의 상대 비교입니다. 기타·보컬·드럼은 동일 대역에 겹치므로 실제로 어떤 악기가 깨졌는지는 확정할 수 없습니다.')
+if r['drum_mode']:
+    st.warning('기준은 **드럼 단독**, 비교 대상은 **합주 전체**입니다. 바이올린 플롯 차이에 드럼 이외 소리도 포함됩니다. 발표에서는 실험적 지표로 소개하세요.')
+
+st.subheader('⑤ 발표용 결과 다운로드')
+with st.spinner('발표에 사용할 PNG 결과 그림을 생성하고 있습니다...'):
+    png=png_report(bad,offset,w,good,r['reference_name'],refdist,baddist)
+st.download_button('📸 발표용 STFT + 바이올린 플롯 PNG 저장',data=png,
+                   file_name='sound_analyzer_v3_report.png',mime='image/png',type='primary')
+st.download_button('📋 대역별 수치 CSV 저장',data=pd.DataFrame(summary).to_csv(index=False).encode('utf-8-sig'),
+                   file_name='sound_analyzer_v3_band_comparison.csv',mime='text/csv')
+with st.expander('결과 해석과 한계'):
+    st.markdown('''
+- **검토 구간**: 정상 기준과 대역 에너지 형태나 드럼 타격 특징이 달라진 시점입니다. 깨짐 확정이 아닙니다.
+- **STFT**: 선택 구간에서 시간과 주파수의 변화를 보여줍니다.
+- **바이올린 플롯**: STFT 각 프레임에서 구한 저역~고역 에너지 분포를 정상/의심 상태별로 비교합니다.
+- **드럼 기준**: 타격성 신호 분리는 드럼만 정확히 분리하는 기술이 아닙니다. 신뢰도를 높이려면 드럼 개별 녹음 또는 전문 소스 분리와 대조해야 합니다.
+- **정밀 검증**: 실제 왜곡 확정에는 무왜곡 원본과의 동기화, 클리핑 징후, 청취 및 측정 환경 통제가 필요합니다.
+''')
