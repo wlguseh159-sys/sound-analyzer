@@ -195,7 +195,7 @@ mode=st.radio('어디를 분석할까요?',[
     '선택한 짧은 구간 비교', 'Broken 전체 탐색 (Good 기준 통계와 비교)'
 ],horizontal=True)
 full=mode.startswith('Broken 전체')
-c1,c2,c3=st.columns(3)
+c1,c2,c3,c4=st.columns(4)
 with c1:
     good_start=st.number_input('Good 기준 시작 (초)',0.,max(0.,gm['duration']-.5),0.,.5)
 with c2:
@@ -205,10 +205,13 @@ with c3:
     bad_start=st.number_input('Broken 시작 (초)',0.,max(0.,bm['duration']-.5),0.,.5)
 if full:
     bad_length=bm['duration']-bad_start
+    with c4:
+        st.number_input('Broken 분석 길이 (초)',value=float(bad_length),disabled=True,format='%.2f',key='full_length_display')
     st.info(f'Broken {bad_start:.1f}~{bm["duration"]:.1f}초를 나누어 탐색합니다. Good {good_start:.1f}~{good_start+ref_len:.1f}초의 **통계적 밸런스 중앙값**만 기준으로 사용하므로, 곡 전개 변화도 이상으로 표시될 수 있습니다.')
 else:
-    bad_length=st.number_input('Broken 분석 길이 (초)',1.,max(1.,bm['duration']-bad_start),
-                               min(10.,max(1.,bm['duration']-bad_start)),.5)
+    with c4:
+        bad_length=st.number_input('Broken 분석 길이 (초)',1.,max(1.,bm['duration']-bad_start),
+                                   min(10.,max(1.,bm['duration']-bad_start)),.5)
     st.caption('Good는 위의 기준 길이만큼 분석해 상대 음량의 중앙값을 구합니다. 시간대별 1:1 동일 악절 비교가 아닙니다.')
 
 config=(hashlib.sha256(good_bytes).hexdigest()[:16],hashlib.sha256(bad_bytes).hexdigest()[:16],
